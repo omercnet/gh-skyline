@@ -60,6 +60,17 @@ func (m *MockGitHubClient) FetchOrgContributions(username string, _ string, _ in
 	return GenerateOrgContributionsResponse(username, "testorg"), nil
 }
 
+// FetchOrgRepoContributions implements GitHubClientInterface for repo-based querying
+func (m *MockGitHubClient) FetchOrgRepoContributions(_ string, _ string, _ int) (map[string]int, error) {
+	if m.Err != nil {
+		return nil, m.Err
+	}
+	return map[string]int{
+		"2024-01-15": 2,
+		"2024-02-20": 1,
+	}, nil
+}
+
 // GenerateOrgContributionsResponse creates mock org contribution data for testing.
 // It generates a sample repository with commit contributions for use in unit tests.
 func GenerateOrgContributionsResponse(username, org string) *types.OrgContributionsResponse {

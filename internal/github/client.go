@@ -4,6 +4,7 @@ package github
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/github/gh-skyline/internal/errors"
@@ -204,6 +205,289 @@ func (c *Client) FetchOrgContributions(username string, org string, year int) (*
 	}
 
 	return &merged, nil
+}
+
+// GetUserID fetches a user's GitHub node ID, required for author filtering in commit queries.
+func (c *Client) GetUserID(username string) (string, error) {
+	if username == "" {
+		return "", errors.New(errors.ValidationError, "username cannot be empty", nil)
+	}
+
+	query := `
+    query UserID($username: String!) {
+        user(login: $username) {
+            id
+        }
+    }`
+
+	variables := map[string]interface{}{
+		"username": username,
+	}
+
+	var response types.UserIDResponse
+	err := c.api.Do(query, variables, &response)
+	if err != nil {
+		return "", errors.New(errors.NetworkError, "failed to fetch user ID", err)
+	}
+
+	if response.User.ID == "" {
+		return "", errors.New(errors.ValidationError, "received empty user ID from GitHub API", nil)
+	}
+
+	return response.User.ID, nil
+}
+
+// FetchOrgRepoContributions retrieves contributions by querying each repository in the organization.
+// This method is used when querying another user's contributions to private org repos,
+// as the contributionsCollection API only exposes public contributions for non-self queries.
+func (c *Client) FetchOrgRepoContributions(username string, org string, year int) (map[string]int, error) {
+	if username == "" {
+		return nil, errors.New(errors.ValidationError, "username cannot be empty", nil)
+	}
+	if org == "" {
+		return nil, errors.New(errors.ValidationError, "org cannot be empty", nil)
+	}
+	if year < 2008 {
+		return nil, errors.New(errors.ValidationError, "year cannot be before GitHub's launch (2008)", nil)
+	}
+
+	userID, err := c.GetUserID(username)
+	if err != nil {
+		return nil, err
+	}
+
+	repos, err := c.fetchOrgRepos(org)
+	if err != nil {
+		return nil, err
+	}
+
+	startDate := fmt.Sprintf("%d-01-01T00:00:00Z", year)
+	endDate := fmt.Sprintf("%d-12-31T23:59:59Z", year)
+
+	dailyCounts := make(map[string]int)
+
+	err = c.fetchRepoCommitDatesBatched(org, repos, userID, startDate, endDate, dailyCounts)
+	if err != nil {
+		return nil, err
+	}
+
+	return dailyCounts, nil
+}
+
+func (c *Client) fetchOrgRepos(org string) ([]string, error) {
+	query := `
+    query OrgRepos($org: String!, $cursor: String) {
+        organization(login: $org) {
+            repositories(first: 100, after: $cursor) {
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+                nodes {
+                    name
+                    defaultBranchRef {
+                        name
+                    }
+                }
+            }
+        }
+    }`
+
+	var repos []string
+	var cursor *string
+
+	for {
+		variables := map[string]interface{}{
+			"org":    org,
+			"cursor": cursor,
+		}
+
+		var response types.OrgReposResponse
+		err := c.api.Do(query, variables, &response)
+		if err != nil {
+			return nil, errors.New(errors.NetworkError, "failed to fetch org repositories", err)
+		}
+
+		for _, repo := range response.Organization.Repositories.Nodes {
+			if repo.DefaultBranchRef != nil {
+				repos = append(repos, repo.Name)
+			}
+		}
+
+		if !response.Organization.Repositories.PageInfo.HasNextPage {
+			break
+		}
+		cursor = &response.Organization.Repositories.PageInfo.EndCursor
+	}
+
+	return repos, nil
+}
+
+func (c *Client) fetchRepoCommitDates(org, repoName, userID, startDate, endDate string, dailyCounts map[string]int) error {
+	query := `
+    query RepoCommits($owner: String!, $name: String!, $authorID: ID!, $since: GitTimestamp!, $until: GitTimestamp!, $cursor: String) {
+        repository(owner: $owner, name: $name) {
+            defaultBranchRef {
+                target {
+                    ... on Commit {
+                        history(first: 100, after: $cursor, author: {id: $authorID}, since: $since, until: $until) {
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                            nodes {
+                                committedDate
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }`
+
+	var cursor *string
+
+	for {
+		variables := map[string]interface{}{
+			"owner":    org,
+			"name":     repoName,
+			"authorID": userID,
+			"since":    startDate,
+			"until":    endDate,
+			"cursor":   cursor,
+		}
+
+		var response types.RepoCommitsResponse
+		err := c.api.Do(query, variables, &response)
+		if err != nil {
+			return err
+		}
+
+		if response.Repository.DefaultBranchRef == nil {
+			break
+		}
+
+		history := response.Repository.DefaultBranchRef.Target.History
+		for _, node := range history.Nodes {
+			if len(node.CommittedDate) >= 10 {
+				dateStr := node.CommittedDate[:10]
+				dailyCounts[dateStr]++
+			}
+		}
+
+		if !history.PageInfo.HasNextPage {
+			break
+		}
+		cursor = &history.PageInfo.EndCursor
+	}
+
+	return nil
+}
+
+const batchSize = 10
+
+func (c *Client) fetchRepoCommitDatesBatched(org string, repos []string, userID, startDate, endDate string, dailyCounts map[string]int) error {
+	reposNeedingPagination := make(map[string]bool)
+
+	for i := 0; i < len(repos); i += batchSize {
+		end := i + batchSize
+		if end > len(repos) {
+			end = len(repos)
+		}
+		batch := repos[i:end]
+
+		query := c.buildBatchQuery(batch)
+
+		var response map[string]interface{}
+		err := c.api.Do(query, map[string]interface{}{
+			"owner":    org,
+			"authorID": userID,
+			"since":    startDate,
+			"until":    endDate,
+		}, &response)
+		if err != nil {
+			continue
+		}
+
+		c.extractDatesFromBatchResponse(response, batch, dailyCounts, reposNeedingPagination)
+	}
+
+	for repoName := range reposNeedingPagination {
+		c.fetchRepoCommitDates(org, repoName, userID, startDate, endDate, dailyCounts)
+	}
+
+	return nil
+}
+
+func (c *Client) buildBatchQuery(repos []string) string {
+	var sb strings.Builder
+	sb.WriteString("query BatchRepoCommits($owner: String!, $authorID: ID!, $since: GitTimestamp!, $until: GitTimestamp!) {\n")
+
+	for i, repo := range repos {
+		sb.WriteString(fmt.Sprintf(`  repo%d: repository(owner: $owner, name: "%s") {
+    defaultBranchRef {
+      target {
+        ... on Commit {
+          history(first: 100, author: {id: $authorID}, since: $since, until: $until) {
+            totalCount
+            nodes { committedDate }
+          }
+        }
+      }
+    }
+  }
+`, i, repo))
+	}
+
+	sb.WriteString("}")
+	return sb.String()
+}
+
+func (c *Client) extractDatesFromBatchResponse(response map[string]interface{}, repos []string, dailyCounts map[string]int, reposNeedingPagination map[string]bool) {
+	for i, repoName := range repos {
+		key := fmt.Sprintf("repo%d", i)
+		repoData, ok := response[key].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		branchRef, ok := repoData["defaultBranchRef"].(map[string]interface{})
+		if !ok || branchRef == nil {
+			continue
+		}
+
+		target, ok := branchRef["target"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		history, ok := target["history"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		if totalCount, ok := history["totalCount"].(float64); ok && totalCount > 100 {
+			reposNeedingPagination[repoName] = true
+			continue
+		}
+
+		nodes, ok := history["nodes"].([]interface{})
+		if !ok {
+			continue
+		}
+
+		for _, node := range nodes {
+			nodeMap, ok := node.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			dateStr, ok := nodeMap["committedDate"].(string)
+			if !ok || len(dateStr) < 10 {
+				continue
+			}
+			dailyCounts[dateStr[:10]]++
+		}
+	}
 }
 
 // GetUserJoinYear fetches the year a user joined GitHub using the GitHub API.

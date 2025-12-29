@@ -22,6 +22,7 @@ type GitHubClientInterface interface {
 	GetUserJoinYear(username string) (int, error)
 	FetchContributions(username string, year int) (*types.ContributionsResponse, error)
 	FetchOrgContributions(username string, org string, year int) (*types.OrgContributionsResponse, error)
+	FetchOrgRepoContributions(username string, org string, year int) (map[string]int, error)
 }
 
 // GenerateSkyline creates a 3D model with ASCII art preview of GitHub contributions for the specified year range, or "full lifetime" of the user
@@ -33,16 +34,19 @@ func GenerateSkyline(startYear, endYear int, targetUser string, org string, full
 		return errors.New(errors.NetworkError, "failed to initialize GitHub client", err)
 	}
 
+	authenticatedUser, err := client.GetAuthenticatedUser()
+	if err != nil {
+		return errors.New(errors.NetworkError, "failed to get authenticated user", err)
+	}
+
 	if targetUser == "" {
 		if err := log.Debug("No target user specified, using authenticated user"); err != nil {
 			return err
 		}
-		username, err := client.GetAuthenticatedUser()
-		if err != nil {
-			return errors.New(errors.NetworkError, "failed to get authenticated user", err)
-		}
-		targetUser = username
+		targetUser = authenticatedUser
 	}
+
+	isQueryingSelf := strings.EqualFold(targetUser, authenticatedUser)
 
 	if full {
 		joinYear, err := client.GetUserJoinYear(targetUser)
@@ -58,7 +62,7 @@ func GenerateSkyline(startYear, endYear int, targetUser string, org string, full
 		var contributions [][]types.ContributionDay
 		var err error
 		if org != "" {
-			contributions, err = fetchOrgContributionData(client, targetUser, org, year)
+			contributions, err = fetchOrgContributionData(client, targetUser, org, year, isQueryingSelf)
 		} else {
 			contributions, err = fetchContributionData(client, targetUser, year)
 		}
@@ -128,7 +132,17 @@ func fetchContributionData(client *github.Client, username string, year int) ([]
 }
 
 // fetchOrgContributionData retrieves contributions filtered to a specific organization.
-func fetchOrgContributionData(client *github.Client, username string, org string, year int) ([][]types.ContributionDay, error) {
+// When querying self (isQueryingSelf=true), uses the fast contributionsCollection API.
+// When querying another user, uses repo-based querying to access private org contributions.
+func fetchOrgContributionData(client *github.Client, username string, org string, year int, isQueryingSelf bool) ([][]types.ContributionDay, error) {
+	if !isQueryingSelf {
+		dailyCounts, err := client.FetchOrgRepoContributions(username, org, year)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch org repo contributions: %w", err)
+		}
+		return buildContributionGrid(year, dailyCounts), nil
+	}
+
 	response, err := client.FetchOrgContributions(username, org, year)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch org contributions: %w", err)

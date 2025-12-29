@@ -283,7 +283,7 @@ func TestFetchOrgContributionDataFiltering(t *testing.T) {
 	}
 
 	client, _ := github.InitializeGitHubClient()
-	grid, err := fetchOrgContributionData(client, "testuser", "targetorg", 2024)
+	grid, err := fetchOrgContributionData(client, "testuser", "targetorg", 2024, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

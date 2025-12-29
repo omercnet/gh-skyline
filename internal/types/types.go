@@ -185,3 +185,49 @@ func (t Triangle) ToFloat32() TriangleFloat32 {
 		V3:     t.V3.ToFloat32(),
 	}
 }
+
+// OrgReposResponse represents the list of repositories in an organization.
+type OrgReposResponse struct {
+	Organization struct {
+		Repositories struct {
+			TotalCount int `json:"totalCount"`
+			PageInfo   struct {
+				HasNextPage bool   `json:"hasNextPage"`
+				EndCursor   string `json:"endCursor"`
+			} `json:"pageInfo"`
+			Nodes []struct {
+				Name             string `json:"name"`
+				DefaultBranchRef *struct {
+					Name string `json:"name"`
+				} `json:"defaultBranchRef"`
+			} `json:"nodes"`
+		} `json:"repositories"`
+	} `json:"organization"`
+}
+
+// RepoCommitsResponse represents commit history for a specific repository.
+type RepoCommitsResponse struct {
+	Repository struct {
+		DefaultBranchRef *struct {
+			Target struct {
+				History struct {
+					TotalCount int `json:"totalCount"`
+					PageInfo   struct {
+						HasNextPage bool   `json:"hasNextPage"`
+						EndCursor   string `json:"endCursor"`
+					} `json:"pageInfo"`
+					Nodes []struct {
+						CommittedDate string `json:"committedDate"`
+					} `json:"nodes"`
+				} `json:"history"`
+			} `json:"target"`
+		} `json:"defaultBranchRef"`
+	} `json:"repository"`
+}
+
+// UserIDResponse represents a response containing a user's node ID.
+type UserIDResponse struct {
+	User struct {
+		ID string `json:"id"`
+	} `json:"user"`
+}
